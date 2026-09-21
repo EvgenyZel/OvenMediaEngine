@@ -339,8 +339,10 @@ namespace pub
 		return ok;
 	}
 
-	bool Stream::EnterStop()
+	bool Stream::EnterStop(StopCause cause)
 	{
+		_stop_cause = cause;
+
 		WaitUntilIdleAndLock();
 
 		bool ok = Stop();

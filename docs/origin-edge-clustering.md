@@ -42,6 +42,28 @@ OvenMediaEngine provides OVT protocol for passing streams from the origin to the
 </Server>
 ```
 
+#### Compatibility
+
+An edge that speaks OVT2 checks the `ovt.required` list of the describe response and refuses the stream when it names a codec it does not support.
+The origin lists the codec of every track whose media type is in `<Required>`.
+The default is `Video` and `Audio`, so the codec of a subtitle or data track is never announced and an edge never refuses a stream over one.
+Such a track is still described and the edge decides for itself: a subtitle track whose codec it does not know is left unregistered, and a data track is always registered because it carries no codec.
+Either way the main stream keeps playing.
+An unknown value in `<MediaType>` fails startup.
+
+```xml
+<Publishers>
+    <OVT>
+        <Compatibility>
+            <Required>
+                <MediaType>Video</MediaType>
+                <MediaType>Audio</MediaType>
+            </Required>
+        </Compatibility>
+    </OVT>
+</Publishers>
+```
+
 ### Edge
 
 The role of the edge is to receive and distribute streams from an origin. You can configure hundreds of Edge to distribute traffic to your players. As a result of testing, a single edge can stream 4-5Gbps traffic by WebRTC based on AWS C5.2XLarge. If you need to stream to thousands of people, you can configure and use multiple edges.

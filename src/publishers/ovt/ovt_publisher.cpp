@@ -1,9 +1,29 @@
 #include "ovt_publisher.h"
 
+#include <modules/ovt_packetizer/ovt_signaling.h>
+
 #include <base/ovlibrary/url.h>
 
 #include "ovt_private.h"
 #include "ovt_session.h"
+
+// A `<Required>` block with no `<MediaType>` in it is the empty set.
+// Without that distinction the member defaults (`Video`, `Audio`) survive
+// and an operator has no way to empty the describe list.
+// It only reaches the `ovt.required` array of a describe. The other channel, the PT 40 set a session
+// learns at packetization, is built from what the media actually carries and has no setting.
+static const std::vector<ov::String> &ConfiguredRequiredMediaTypes(const cfg::vhost::app::Application &app_config) MAY_THROWS(cfg::ConfigError)
+{
+	static const std::vector<ov::String> none;
+
+	bool required_configured = false;
+	const auto &required	 = app_config.GetPublishers().GetOvtPublisher().GetCompatibility().GetRequired(&required_configured);
+
+	bool list_configured	 = false;
+	const auto &names		 = required.GetMediaTypeList(&list_configured);
+
+	return (required_configured && (list_configured == false)) ? none : names;
+}
 
 std::shared_ptr<OvtPublisher> OvtPublisher::Create(const cfg::Server &server_config, const std::shared_ptr<MediaRouterInterface> &router)
 {
@@ -143,6 +163,14 @@ std::shared_ptr<pub::Application> OvtPublisher::OnCreatePublisherApplication(con
 		return nullptr;
 	}
 
+	// The operator needs one place to check the policy against what they configured.
+	// This is the setting, not the tokens a describe ends up carrying: those depend on the tracks
+	// that stream has, so they only exist per describe.
+	const auto &required_media_types = ConfiguredRequiredMediaTypes(application_info.GetConfig());
+	logti("OVT publisher of %s requires an edge to know the codecs of these media types: %s",
+		  application_info.GetVHostAppName().CStr(),
+		  required_media_types.empty() ? "(none)" : ov::String::Join(required_media_types, ", ").CStr());
+
 	return OvtApplication::Create(OvtPublisher::GetSharedPtrAs<pub::Publisher>(), application_info);
 }
 
@@ -151,30 +179,36 @@ bool OvtPublisher::OnDeletePublisherApplication(const std::shared_ptr<pub::Appli
 	return true;
 }
 
-std::shared_ptr<OvtDepacketizer> OvtPublisher::GetDepacketizer(int remote_id)
+std::shared_ptr<OvtPublisher::RemoteContext> OvtPublisher::GetRemoteContext(int remote_id)
 {
-	std::lock_guard<std::mutex> guard(_depacketizers_lock);
-	std::shared_ptr<OvtDepacketizer> depacketizer;
+	std::lock_guard<std::mutex> guard(_remotes_lock);
 
-	// if there is no depacketizer, create
-	if (_depacketizers.find(remote_id) == _depacketizers.end())
+	auto it = _remotes.find(remote_id);
+	if (it != _remotes.end())
 	{
-		depacketizer = std::make_shared<OvtDepacketizer>();
-		_depacketizers[remote_id] = depacketizer;
-	}
-	else
-	{
-		return _depacketizers[remote_id];
+		return it->second;
 	}
 
-	return depacketizer;
+	auto context		  = std::make_shared<RemoteContext>();
+	context->depacketizer = std::make_shared<OvtDepacketizer>(OvtDepacketizer::MediaRole::MessagesOnly);
+	_remotes[remote_id]	  = context;
+
+	return context;
 }
 
-bool OvtPublisher::RemoveDepacketizer(int remote_id)
+bool OvtPublisher::RemoveRemoteContext(int remote_id)
 {
-	std::lock_guard<std::mutex> guard(_depacketizers_lock);
-	_depacketizers.erase(remote_id);
+	std::lock_guard<std::mutex> guard(_remotes_lock);
+	_remotes.erase(remote_id);
 	return true;
+}
+
+void OvtPublisher::AppendOvtObject(const std::shared_ptr<ov::Socket> &remote, Json::Value &root)
+{
+	if (GetRemoteContext(remote->GetNativeHandle())->is_ovt2)
+	{
+		root["ovt"] = ovt::MakeResponseOvtObject();
+	}
 }
 
 void OvtPublisher::OnConnected(const std::shared_ptr<ov::Socket> &remote)
@@ -187,31 +221,105 @@ void OvtPublisher::OnDataReceived(const std::shared_ptr<ov::Socket> &remote,
 								  const ov::SocketAddress &address,
 								  const std::shared_ptr<const ov::Data> &data)
 {
-	auto depacketizer = GetDepacketizer(remote->GetNativeHandle());
+	auto context = GetRemoteContext(remote->GetNativeHandle());
+	auto depacketizer = context->depacketizer;
 
 	if (depacketizer->AppendPacket(data) == false)
 	{
+		// The depacketizer does not consume bytes it cannot parse, so an unparsable connection is closed.
 		ResponseResult(remote, 0, "unknown", 0, 500, "Server Internals Error");
+		RemoveSessions(remote->GetNativeHandle());
+		remote->Close();
 		return;
 	}
 
-	if (!depacketizer->IsAvailableMessage())
+	// An origin never receives media, so its depacketizer discards a media fragment as it is parsed
+	// rather than reassembling one it is certain to throw away. Nothing reaches the queue, so the count
+	// is the only way to see that a peer sent any.
+	if ((context->media_dropped == false) && (depacketizer->GetDroppedMediaFragmentCount() > 0))
 	{
-		logtc("Unavailable message");
+		context->media_dropped = true;
+		logtw(
+			"Dropped at least %zu media fragment(s) from %s; an origin only takes requests. "
+			"Further occurrences will be suppressed",
+			depacketizer->GetDroppedMediaFragmentCount(), remote->ToString().CStr());
 	}
 
-	while (depacketizer->IsAvailableMessage())
+	while (true)
 	{
+		// Empty when the queue has no whole message left
 		auto message = depacketizer->PopMessage();
+		if (message.has_value() == false)
+		{
+			break;
+		}
 
-		// Parsing Payload
-		ov::String payload(message->GetDataAs<char>(), message->GetLength());
-		ov::JsonObject object = ov::Json::Parse(payload);
+		// An origin only takes requests
+		if (message->payload_type != OvtPayloadType::MessageRequest)
+		{
+			if (context->unknown_message_dropped == false)
+			{
+				context->unknown_message_dropped = true;
+				logtw("Ignored a message with payload type %u from %s", ov::ToUnderlyingType(message->payload_type), remote->ToString().CStr());
+			}
 
-		if (object.IsNull())
+			continue;
+		}
+
+		// Parsing Payload.
+		// `Parse()` throws on a payload the parser refuses, and nesting past jsoncpp's stack limit
+		// is reachable from one packet, so the throw is answered like any other malformed request.
+		ov::String payload(message->data->GetDataAs<char>(), message->data->GetLength());
+		bool parse_failed	  = false;
+		ov::JsonObject object = [&]() {
+			try
+			{
+				return ov::Json::Parse(payload);
+			}
+			catch (const Json::Exception &e)
+			{
+				logtw("An invalid request from %s : %s", remote->ToString().CStr(), e.what());
+				parse_failed = true;
+				return ov::JsonObject();
+			}
+		}();
+
+		// A rejected request does not end the drain: one `AppendPacket()` can queue several messages,
+		// and nothing else pops them, so returning here would leave a valid request behind this one
+		// unanswered until more bytes happen to arrive.
+		if (parse_failed || object.IsNull() || (object.GetJsonValue().isObject() == false))
 		{
 			ResponseResult(remote, 0, "unknown", 0, 404, "An invalid request : Json format");
-			return;
+			continue;
+		}
+
+		// OVT1 detection: a request without the `ovt` object is an OVT1 edge.
+		// No other field is used to guess, and every request is judged on its own.
+		const Json::Value &root = object.GetJsonValue();
+
+		if (ovt::HasNonObjectOvt(root))
+		{
+			ResponseResult(remote, 0, "unknown", 0, 404, "An invalid request : ovt must be an object");
+			continue;
+		}
+
+		context->is_ovt2		= ovt::HasOvtObject(root);
+		// Kept, never judged on. A later release reads it to hold back what this generation of edge
+		// mishandles; refusing on it would let this origin decide for a build that knows more than it.
+		context->edge_version	= ovt::GetPeerVersion(root);
+
+		const auto announcement = std::make_pair(context->is_ovt2, context->edge_version);
+		if (context->announced != announcement)
+		{
+			// Only this one log line reads it, so it does not outlive the request
+			auto agent		   = (context->is_ovt2 && root["ovt"]["agent"].isString())
+									 ? ovt::SanitizeForLog(root["ovt"]["agent"].asString().c_str())
+									 : ov::String();
+
+			context->announced = announcement;
+			logti("OVT edge %s speaks %s (generation %u)%s%s", remote->ToString().CStr(),
+				  context->is_ovt2 ? "OVT2" : "OVT1", context->edge_version,
+				  agent.IsEmpty() ? "" : ", agent: ", agent.CStr());
 		}
 
 		Json::Value &json_request_id = object.GetJsonValue()["id"];
@@ -223,7 +331,7 @@ void OvtPublisher::OnDataReceived(const std::shared_ptr<ov::Socket> &remote,
 			json_request_target.isNull() || !json_request_target.isString())
 		{
 			ResponseResult(remote, 0, "unknown", 0, 404, "An invalid request : id or target or application are invalid");
-			return;
+			continue;
 		}
 
 		uint32_t request_id = json_request_id.asUInt();
@@ -232,24 +340,48 @@ void OvtPublisher::OnDataReceived(const std::shared_ptr<ov::Socket> &remote,
 		if (url == nullptr)
 		{
 			ResponseResult(remote, 0, "unknown", json_request_id.asUInt(), 404, "An invalid request : Target is not valid");
-			return;
+			continue;
 		}
 
-		if (app.UpperCaseString() == "DESCRIBE")
+		// `HandleDescribeRequest()` reads the publisher configuration, and the `cfg` getters throw when
+		// the config tree no longer holds a member they name. The throw stops here rather than leaving
+		// the socket worker, which has no handler of its own.
+		try
 		{
-			HandleDescribeRequest(remote, request_id, url);
+			if (ovt::IsApplication(app, ovt::APPLICATION_DESCRIBE))
+			{
+				HandleDescribeRequest(remote, request_id, url);
+			}
+			else if (ovt::IsApplication(app, ovt::APPLICATION_PLAY))
+			{
+				// The edge names the tracks it will register. It can only do that after seeing a
+				// describe, so this is the one message that carries a selection. An OVT1 edge names none.
+				size_t ignored			 = 0;
+				auto requested_track_ids = context->is_ovt2
+											   ? ovt::ParseTrackIdArray(root["ovt"]["trackIds"], &ignored)
+											   : std::nullopt;
+				if (ignored > 0)
+				{
+					logtw("Ignored %zu non-integer entries in the play request's trackIds from %s",
+						  ignored, remote->ToString().CStr());
+				}
+
+				HandlePlayRequest(remote, request_id, url, requested_track_ids);
+			}
+			else if (ovt::IsApplication(app, ovt::APPLICATION_STOP))
+			{
+				HandleStopRequest(remote, 0, request_id, url);
+			}
+			else
+			{
+				ResponseResult(remote, 0, app.CStr(), request_id, 404, "Unknown application");
+			}
 		}
-		else if (app.UpperCaseString() == "PLAY")
+		catch (const cfg::ConfigError &e)
 		{
-			HandlePlayRequest(remote, request_id, url);
-		}
-		else if (app.UpperCaseString() == "STOP")
-		{
-			HandleStopRequest(remote, 0, request_id, url);
-		}
-		else
-		{
-			ResponseResult(remote, 0, app.CStr(), request_id, 404, "Unknown application");
+			logte("Could not read the OVT publisher configuration while answering %s from %s : %s",
+				  app.CStr(), remote->ToString().CStr(), e.What());
+			ResponseResult(remote, 0, app.CStr(), request_id, 500, "Server Internals Error");
 		}
 	}
 }
@@ -269,19 +401,108 @@ void OvtPublisher::OnDisconnected(const std::shared_ptr<ov::Socket> &remote,
 	// disconnect means when the stream disconnects itself.
 	if (reason != PhysicalPortDisconnectReason::Disconnect)
 	{
-		std::shared_lock<std::shared_mutex> lock(_remote_stream_map_lock);
-		auto streams = _remote_stream_map.equal_range(remote->GetNativeHandle());
-		for (auto it = streams.first; it != streams.second; ++it)
-		{
-			auto stream = it->second;
-			stream->RemoveSessionByConnectorId(remote->GetNativeHandle());
-		}
+		RemoveSessions(remote->GetNativeHandle());
 	}
 	UnlinkRemoteFromStream(remote->GetNativeHandle());
-	RemoveDepacketizer(remote->GetNativeHandle());
+	RemoveRemoteContext(remote->GetNativeHandle());
 }
 
-void OvtPublisher::HandleDescribeRequest(const std::shared_ptr<ov::Socket> &remote, const uint32_t request_id, const std::shared_ptr<const ov::Url> &url)
+void OvtPublisher::RemoveSessions(int remote_id)
+{
+	std::shared_lock<std::shared_mutex> lock(_remote_stream_map_lock);
+	auto streams = _remote_stream_map.equal_range(remote_id);
+	for (auto it = streams.first; it != streams.second; ++it)
+	{
+		auto stream = it->second;
+		stream->RemoveSessionByConnectorId(remote_id);
+	}
+}
+
+bool OvtPublisher::ResolveTrackFilter(const std::shared_ptr<ov::Socket> &remote, const std::shared_ptr<OvtStream> &stream, const ov::String &track_set_name, const std::optional<std::set<uint32_t>> &requested_track_ids, OvtTrackFilter &filter)
+{
+	filter.legacy_edge		   = (GetRemoteContext(remote->GetNativeHandle())->is_ovt2 == false);
+	filter.requested_track_ids = requested_track_ids;
+
+	if (track_set_name.IsEmpty() == false)
+	{
+		std::set<uint32_t> track_ids;
+		if (stream->ResolveTrackSetTrackIds(track_set_name, track_ids) == false)
+		{
+			return false;
+		}
+
+		filter.track_set_ids = std::move(track_ids);
+	}
+
+	return true;
+}
+
+// The PLAY response tells an OVT2 edge exactly which tracks it will receive,
+// so what the edge registers is always a subset of what is sent,
+// even when a track change landed between describe and play.
+// A session that lost a track also gets its playlists rebuilt for that same set: the describe's copy
+// was written before the edge made its selection, so only this one has renditions that match the
+// tracks the edge ends up with. A session that kept every track keeps the describe's copy.
+void OvtPublisher::SendPlayResponse(const std::shared_ptr<ov::Socket> &remote, uint32_t session_id, uint32_t request_id,
+									const std::shared_ptr<OvtStream> &stream, const std::optional<std::set<uint32_t>> &allowed_track_ids)
+{
+	Json::Value root;
+	root["id"]			= request_id;
+	root["application"] = ovt::APPLICATION_PLAY;
+	root["code"]		= 200;
+	root["message"]		= "ok";
+	AppendOvtObject(remote, root);
+
+	if (root.isMember("ovt"))
+	{
+		std::set<uint32_t> every_track_id;
+		for (const auto &[track_id, track] : stream->GetTracks())
+		{
+			every_track_id.insert(static_cast<uint32_t>(track_id));
+		}
+
+		const auto confirmed = allowed_track_ids.value_or(every_track_id);
+
+		Json::Value ids(Json::arrayValue);
+		for (auto track_id : confirmed)
+		{
+			ids.append(track_id);
+		}
+		root["ovt"]["allowedTrackIds"] = ids;
+
+		// Only a session that lost a track needs its renditions rebuilt. Sending a rebuilt set to a
+		// session that kept everything would replace the describe's playlists with ones that went
+		// through the rendition pruning for nothing.
+		if (confirmed != every_track_id)
+		{
+			root["ovt"]["playlists"] = stream->BuildPlaylistsForTracks(confirmed);
+		}
+
+		if (ids.empty())
+		{
+			root["ovt"]["reason"] = ovt::REASON_NO_DELIVERABLE_TRACK;
+		}
+	}
+
+	SendResponse(remote, session_id, ov::Json::Stringify(root));
+}
+
+std::set<cmn::MediaType> OvtPublisher::GetRequiredMediaTypes(const std::shared_ptr<OvtStream> &stream) MAY_THROWS(cfg::ConfigError)
+{
+	std::set<cmn::MediaType> media_types;
+	for (const auto &name : ConfiguredRequiredMediaTypes(stream->GetApplication()->GetConfig()))
+	{
+		auto media_type = cmn::GetMediaTypeByName(name);
+		if (media_type.has_value())
+		{
+			media_types.insert(*media_type);
+		}
+	}
+
+	return media_types;
+}
+
+void OvtPublisher::HandleDescribeRequest(const std::shared_ptr<ov::Socket> &remote, const uint32_t request_id, const std::shared_ptr<const ov::Url> &url) MAY_THROWS(cfg::ConfigError)
 {
 	auto orchestrator = ocst::Orchestrator::GetInstance();
 
@@ -329,29 +550,84 @@ void OvtPublisher::HandleDescribeRequest(const std::shared_ptr<ov::Socket> &remo
 		return;
 	}
 
-	Json::Value description;
-	auto result = track_set_name.IsEmpty()
-				  ? stream->GetDescription(description)
-				  : stream->GetDescription(track_set_name, description);
-	if (result == false)
+	// A describe carries no selection: the edge has not seen the track list yet.
+	OvtTrackFilter filter;
+	if (ResolveTrackFilter(remote, stream, track_set_name, std::nullopt, filter) == false)
 	{
-		if (track_set_name.IsEmpty() == false)
-		{
-			msg.Format("(%s/%s) stream has no TrackSet named [%s].",
-					   vhost_app_name.CStr(), url->Stream().CStr(), track_set_name.CStr());
-		}
-		else
-		{
-			msg.Format("(%s/%s) stream doesn't have description.", vhost_app_name.CStr(), url->Stream().CStr());
-		}
+		msg.Format("(%s/%s) stream has no TrackSet named [%s].",
+				   vhost_app_name.CStr(), url->Stream().CStr(), track_set_name.CStr());
 		ResponseResult(remote, 0, "describe", request_id, 404, msg);
 		return;
 	}
 
-	ResponseResult(remote, 0, "describe", request_id, 200, "ok", description);
+	// Read before the description is built. A change that lands in between then shows up as a
+	// difference the session catches up on; the other order could hide a change the description missed.
+	// It is recorded only once the response is on its way, so a failed describe leaves no baseline.
+	const auto described_epoch = stream->GetTrackEpoch();
+
+	Json::Value description;
+	bool filtered = false;
+	if (stream->GetDescription(filter, description, &filtered) == false)
+	{
+		msg.Format("(%s/%s) stream doesn't have description.", vhost_app_name.CStr(), url->Stream().CStr());
+		ResponseResult(remote, 0, "describe", request_id, 404, msg);
+		return;
+	}
+
+	// An empty track set answers 200 with an empty `tracks`, which is what v0.21.0.0 did.
+	// An OVT2 edge is told why in `ovt.reason` below and stops instead of waiting for media.
+	const bool no_deliverable_track = description["stream"]["tracks"].empty();
+	if (no_deliverable_track)
+	{
+		logtw("(%s/%s) has no track this edge can receive", vhost_app_name.CStr(), url->Stream().CStr());
+	}
+
+	if (filter.legacy_edge)
+	{
+		// An OVT1 edge ignores the keys it does not know, so the OVT2 form goes out as it is.
+		// Only the index hints need rewriting, and only when filtering moved a track out of its group.
+		if (filtered)
+		{
+			OvtStream::RenumberIndexHints(description["stream"]);
+		}
+		RememberDescribedStream(remote, stream->GetId(), described_epoch);
+		ResponseResult(remote, 0, "describe", request_id, 200, "ok", description);
+		return;
+	}
+
+	// The required set names the codecs of the tracks the edge is about to see;
+	// an edge that does not know one of them refuses the stream before any media flows
+	auto required = OvtStream::CollectRequiredTokens(description, GetRequiredMediaTypes(stream));
+
+	Json::Value root;
+	root["id"]			= request_id;
+	root["application"] = ovt::APPLICATION_DESCRIBE;
+	root["code"]		= 200;
+	root["message"]		= "ok";
+	root["contents"]	= description;
+	AppendOvtObject(remote, root);
+	if (no_deliverable_track)
+	{
+		root["ovt"]["reason"] = ovt::REASON_NO_DELIVERABLE_TRACK;
+	}
+	root["ovt"]["required"] = Json::Value(Json::arrayValue);
+	for (const auto &token : required)
+	{
+		root["ovt"]["required"].append(token.CStr());
+	}
+
+	RememberDescribedStream(remote, stream->GetId(), described_epoch);
+	SendResponse(remote, 0, ov::Json::Stringify(root));
 }
 
-void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, uint32_t request_id, const std::shared_ptr<const ov::Url> &url)
+void OvtPublisher::RememberDescribedStream(const std::shared_ptr<ov::Socket> &remote, info::stream_id_t stream_id, uint32_t track_epoch)
+{
+	auto context				 = GetRemoteContext(remote->GetNativeHandle());
+	context->described_stream_id = stream_id;
+	context->track_epoch		 = track_epoch;
+}
+
+void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, uint32_t request_id, const std::shared_ptr<const ov::Url> &url, const std::optional<std::set<uint32_t>> &requested_track_ids)
 {
 	auto vhost_app_name = ocst::Orchestrator::GetInstance()->ResolveApplicationNameFromDomain(url->Host(), url->App());
 
@@ -373,21 +649,26 @@ void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, 
 		return;
 	}
 
-	// Optional TrackSet selector (3rd path segment).
+	// Optional TrackSet selector (3rd path segment), composed with the OVT1 codec removal
 	auto track_set_name = url->File();
-	std::set<uint32_t> allowed_track_ids;
-	size_t video_count = 0;
-	size_t audio_count = 0;
-	if (track_set_name.IsEmpty() == false)
+	OvtTrackFilter filter;
+	if (ResolveTrackFilter(remote, stream, track_set_name, requested_track_ids, filter) == false)
 	{
-		if (stream->ResolveTrackSetTrackIds(track_set_name, allowed_track_ids, video_count, audio_count) == false)
-		{
-			ov::String msg;
-			msg.Format("(%s/%s) stream has no TrackSet named [%s].",
-					   vhost_app_name.CStr(), url->Stream().CStr(), track_set_name.CStr());
-			ResponseResult(remote, 0, "play", request_id, 404, msg);
-			return;
-		}
+		ov::String msg;
+		msg.Format("(%s/%s) stream has no TrackSet named [%s].",
+				   vhost_app_name.CStr(), url->Stream().CStr(), track_set_name.CStr());
+		ResponseResult(remote, 0, "play", request_id, 404, msg);
+		return;
+	}
+
+	// The set the session will actually deliver.
+	// Describe and play select independently, so a track change in between can empty the set only now.
+	// An empty set still answers 200 and still creates the session, as v0.21.0.0 did;
+	// `SendPlayResponse()` puts the reason in the `ovt` object for an OVT2 edge.
+	auto allowed_track_ids = stream->ResolveAllowedTrackIds(filter);
+	if (allowed_track_ids.has_value() && allowed_track_ids->empty())
+	{
+		logtw("(%s/%s) has no track this edge can receive", vhost_app_name.CStr(), url->Stream().CStr());
 	}
 
 	// Session ID is remote socket's ID
@@ -400,21 +681,24 @@ void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, 
 		return;
 	}
 
-	if (track_set_name.IsEmpty() == false)
+	auto context		 = GetRemoteContext(remote->GetNativeHandle());
+	// Only this connection's describe of this stream says what the edge already knows
+	auto described_epoch = (context->described_stream_id == stream->GetId())
+							   ? std::optional<uint32_t>(context->track_epoch)
+							   : std::nullopt;
+	session->SetPeer(context->is_ovt2, described_epoch);
+
+	if (allowed_track_ids.has_value())
 	{
-		// Enable the TrackSet filter even if the resolved id set is empty so
-		// that PLAY behavior matches DESCRIBE (which returns an empty tracks
-		// payload in that case); otherwise an empty set would be treated as
-		// "no filter" and the full stream would be broadcast.
-		session->SetAllowedTrackIds(allowed_track_ids);
-		logti("OVT session connected with TrackSet [%s], %zu video + %zu audio tracks (stream %s/%s)",
-			  track_set_name.CStr(), video_count, audio_count,
+		session->SetAllowedTrackIds(*allowed_track_ids);
+		logti("OVT session connected with %zu of the tracks (TrackSet [%s], %s edge, stream %s/%s)",
+			  allowed_track_ids->size(), track_set_name.CStr(), filter.legacy_edge ? "OVT1" : "OVT2",
 			  vhost_app_name.CStr(), url->Stream().CStr());
 	}
 
 	LinkRemoteWithStream(remote->GetNativeHandle(), stream);
 
-	ResponseResult(remote, session->GetId(), "play", request_id, 200, "ok");
+	SendPlayResponse(remote, session->GetId(), request_id, stream, allowed_track_ids);
 
 	stream->AddSession(session);
 }
@@ -432,6 +716,8 @@ void OvtPublisher::HandleStopRequest(const std::shared_ptr<ov::Socket> &remote, 
 		return;
 	}
 
+	// Spelled out with the direction: the origin's own stop notification uses the same message name
+	logti("Edge %s requested stop of %s/%s", remote->ToString().CStr(), vhost_app_name.CStr(), url->Stream().CStr());
 	ResponseResult(remote, session_id, "stop", request_id, 200, "ok");
 
 	// Session ID is remote socket's ID
@@ -443,9 +729,10 @@ void OvtPublisher::ResponseResult(const std::shared_ptr<ov::Socket> &remote, uin
 	Json::Value root;
 
 	root["id"] = request_id;
-	root["application"] = app.CStr();
+	root["application"] = ovt::TruncateForResponse(app).CStr();
 	root["code"] = code;
-	root["message"] = msg.CStr();
+	root["message"] = ovt::TruncateForResponse(msg).CStr();
+	AppendOvtObject(remote, root);
 
 	SendResponse(remote, session_id, ov::Json::Stringify(root));
 }
@@ -455,10 +742,11 @@ void OvtPublisher::ResponseResult(const std::shared_ptr<ov::Socket> &remote, uin
 	Json::Value root;
 
 	root["id"] = request_id;
-	root["application"] = app.CStr();
+	root["application"] = ovt::TruncateForResponse(app).CStr();
 	root["code"] = code;
-	root["message"] = msg.CStr();
+	root["message"] = ovt::TruncateForResponse(msg).CStr();
 	root["contents"] = contents;
+	AppendOvtObject(remote, root);
 
 	SendResponse(remote, session_id, ov::Json::Stringify(root));
 }
@@ -467,11 +755,16 @@ void OvtPublisher::SendResponse(const std::shared_ptr<ov::Socket> &remote, uint3
 {
 	OvtPacketizer packetizer;
 
-	if (packetizer.PacketizeMessage(OVT_PAYLOAD_TYPE_MESSAGE_RESPONSE, ov::Clock::NowMSec(), payload.ToData(false)) == false)
+	if (packetizer.PacketizeMessage(OvtPayloadType::MessageResponse, ov::Clock::NowMSec(), payload.ToData(false)) == false)
 	{
 		return;
 	}
 
+	// The whole response goes out in one `Send()` even when it is fragmented.
+	// A socket write is queued whole, but the stream worker writes media and notifications to the same
+	// socket, and an edge appends consecutive message fragments into one buffer: a packet landing
+	// between two fragments would be glued onto this response and fail its JSON parse.
+	auto response = std::make_shared<ov::Data>();
 	while (packetizer.IsAvailablePackets())
 	{
 		auto packet = packetizer.PopPacket();
@@ -480,8 +773,10 @@ void OvtPublisher::SendResponse(const std::shared_ptr<ov::Socket> &remote, uint3
 			return;
 		}
 
-		remote->Send(packet->GetData());
+		response->Append(packet->GetData());
 	}
+
+	remote->Send(response);
 }
 
 bool OvtPublisher::LinkRemoteWithStream(int remote_id, std::shared_ptr<OvtStream> &stream)
