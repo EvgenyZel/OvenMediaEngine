@@ -2498,6 +2498,27 @@ void LLHlsStream::OnMediaChunkUpdated(const int32_t &track_id, const uint32_t &s
 		}
 	}
 
+	// Drive auto key rotation off the media timeline, then top up the key of the next period
+	// so that a rotation always has one ready. This runs before the completion is published:
+	// the next segment is already pre-created and empty, so a pending rotation is applied to
+	// it here and its initialization section exists by the time the next partial is hinted
+	if (last_chunk == true)
+	{
+		auto media_time_ms = static_cast<int64_t>((static_cast<double>(partial_segment->GetStartTimestamp()) / GetTrack(track_id)->GetTimeBase().GetTimescale()) * 1000.0);
+		CheckAutoKeyRotation(media_time_ms);
+		PrefetchNextKeyIfNeeded(media_time_ms);
+
+		auto packager = GetPackager(track_id);
+		if (packager != nullptr)
+		{
+			packager->TryApplyPendingKeyRotationAtSegmentStart();
+
+			// The map the hinted partial will be packaged against; the chunklist hints
+			// it as TYPE=MAP when a rotation made it differ from this segment's
+			partial_info.SetUpcomingMapUri(GetMapUriForTrackVersion(track_id, packager->GetCurrentContentVersion()));
+		}
+	}
+
 	// A segment's first chunk can bring a codec into the listing; the cached
 	// master playlists do not advertise it yet
 	auto codecs_union_before = (chunk_number == 0) ? playlist->GetListedCodecsUnion() : ov::String();
@@ -2508,17 +2529,6 @@ void LLHlsStream::OnMediaChunkUpdated(const int32_t &track_id, const uint32_t &s
 	{
 		std::unique_lock<std::mutex> guard(_master_playlists_lock);
 		_master_playlists.clear();
-	}
-
-	// Drive auto key rotation off the media timeline, then top up the key of the next period
-	// so that a rotation always has one ready. A rotation takes effect where a new segment
-	// starts whenever it is decided, so this point carries no meaning of its own; it is
-	// simply where the check runs once per segment instead of once per chunk.
-	if (last_chunk == true)
-	{
-		auto media_time_ms = static_cast<int64_t>((static_cast<double>(partial_segment->GetStartTimestamp()) / GetTrack(track_id)->GetTimeBase().GetTimescale()) * 1000.0);
-		CheckAutoKeyRotation(media_time_ms);
-		PrefetchNextKeyIfNeeded(media_time_ms);
 	}
 
 	logtt("Media chunk updated : track_id = %u, segment_number = %u, chunk_number = %d, start_timestamp = %" PRId64 ", chunk_duration = %f", track_id, segment_number, chunk_number, partial_segment->GetStartTimestamp(), chunk_duration);

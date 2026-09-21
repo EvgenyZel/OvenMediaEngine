@@ -286,6 +286,13 @@ bool LLHlsChunklist::AppendPartialSegmentInfo(uint32_t segment_sequence, const S
 			segment->SetCompleted();
 			_last_completed_segment_sequence = segment_sequence;
 			_first_segment = false;
+
+			// The map of the partial hinted next. A key rotation opening the next
+			// segment makes it differ from this segment's, and the hint reads it
+			if (info.GetUpcomingMapUri().IsEmpty() == false)
+			{
+				_upcoming_map_uri = info.GetUpcomingMapUri();
+			}
 		}
 	
 		_last_segment_sequence = segment_sequence;

@@ -25,7 +25,7 @@ namespace
 
 	// Simulates a segment packaged against the given track version, the way
 	// LLHlsStream::OnMediaChunkUpdated stamps partial infos from the storage segment
-	void AppendSegment(const std::shared_ptr<LLHlsChunklist> &chunklist, uint32_t sequence, uint32_t track_version, const ov::String &map_uri, bool discontinuity_point = false, const ov::String &codecs = "")
+	void AppendSegment(const std::shared_ptr<LLHlsChunklist> &chunklist, uint32_t sequence, uint32_t track_version, const ov::String &map_uri, bool discontinuity_point = false, const ov::String &codecs = "", const ov::String &upcoming_map_uri = "")
 	{
 		auto url = ov::String::FormatString("seg_1_%u_video_key_llhls.m4s", sequence);
 		chunklist->CreateSegmentInfo(LLHlsChunklist::SegmentInfo(sequence, url));
@@ -36,6 +36,7 @@ namespace
 		partial_info.SetTrackVersion(track_version);
 		partial_info.SetMapUri(map_uri);
 		partial_info.SetCodecsParameter(codecs);
+		partial_info.SetUpcomingMapUri(upcoming_map_uri);
 		if (discontinuity_point == true)
 		{
 			partial_info.SetDiscontinuity();
@@ -296,6 +297,50 @@ TEST(LLHlsChunklist, KeyRotationEmitsNewKeyWithoutDiscontinuity)
 
 	// The new key precedes the segment it applies to
 	EXPECT_LT(key_b_index, playlist.IndexOf("seg_1_2_video_key_llhls.m4s"));
+}
+
+TEST(LLHlsChunklist, KeyRotationHintsUpcomingMapOnCompletingChunk)
+{
+	auto chunklist = CreateChunklist(CreateVideoTrack());
+	chunklist->EnableCenc(1, MakeCencProperty(kKeyIdA));
+	chunklist->EnableCenc(2, MakeCencProperty(kKeyIdB));
+
+	AppendSegment(chunklist, 0, 1, kInitialMapUri);
+	// The chunk completing segment 1 carries the map of the rotated version that
+	// opens segment 2, the way LLHlsStream stamps it after applying the rotation
+	AppendSegment(chunklist, 1, 1, kInitialMapUri, false, "", kSecondMapUri);
+
+	auto playlist = chunklist->ToString("", false, false, false);
+
+	// The hinted partial belongs to the new version, so its map is hinted ahead of it
+	auto map_hint_index = playlist.IndexOf("#EXT-X-PRELOAD-HINT:TYPE=MAP,URI=\"init_1_video_key_v2_llhls.m4s\"");
+	auto part_hint_index = playlist.IndexOf("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part_1_1_1_video_key_llhls.m4s\"");
+	EXPECT_NE(map_hint_index, -1);
+	EXPECT_NE(part_hint_index, -1);
+	EXPECT_LT(map_hint_index, part_hint_index);
+
+	// The listed segments still carry the old map only
+	EXPECT_EQ(playlist.IndexOf("#EXT-X-MAP:URI=\"init_1_video_key_v2_llhls.m4s\""), -1);
+
+	// The first partial of the rotated version retires the hint and lists the map inline
+	AppendSegment(chunklist, 2, 2, kSecondMapUri);
+	playlist = chunklist->ToString("", false, false, false);
+	EXPECT_EQ(playlist.IndexOf("#EXT-X-PRELOAD-HINT:TYPE=MAP"), -1);
+	EXPECT_NE(playlist.IndexOf("#EXT-X-MAP:URI=\"init_1_video_key_v2_llhls.m4s\""), -1);
+	EXPECT_EQ(playlist.IndexOf("#EXT-X-DISCONTINUITY"), -1);
+}
+
+TEST(LLHlsChunklist, CompletingChunkWithUnchangedMapDoesNotHintMap)
+{
+	auto chunklist = CreateChunklist(CreateVideoTrack());
+
+	AppendSegment(chunklist, 0, 1, kInitialMapUri);
+	// No rotation: the completing chunk names the map already in effect
+	AppendSegment(chunklist, 1, 1, kInitialMapUri, false, "", kInitialMapUri);
+
+	auto playlist = chunklist->ToString("", false, false, false);
+	EXPECT_EQ(playlist.IndexOf("#EXT-X-PRELOAD-HINT:TYPE=MAP"), -1);
+	EXPECT_NE(playlist.IndexOf("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part_1_1_1_video_key_llhls.m4s\""), -1);
 }
 
 TEST(LLHlsChunklist, TrackChangeKeepingTheKeyDoesNotRepeatIt)

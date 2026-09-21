@@ -185,6 +185,19 @@ public:
 			return _map_uri;
 		}
 
+		// Initialization segment the partial hinted after this chunk will be packaged
+		// against. Carried on the chunk completing a segment so that the part hint and
+		// the map hint are published in the same update
+		void SetUpcomingMapUri(const ov::String &map_uri)
+		{
+			_upcoming_map_uri = map_uri;
+		}
+
+		const ov::String &GetUpcomingMapUri() const
+		{
+			return _upcoming_map_uri;
+		}
+
 		// Version of the track configuration this segment was packaged against
 		void SetTrackVersion(uint32_t track_version)
 		{
@@ -254,6 +267,7 @@ public:
 		bool _completed = false;
 		bool _discontinuity = false;
 		ov::String _map_uri;
+		ov::String _upcoming_map_uri;
 		uint32_t _track_version = 0;
 		ov::String _codecs_parameter;
 
