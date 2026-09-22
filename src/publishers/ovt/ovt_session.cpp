@@ -288,6 +288,8 @@ void OvtSession::SendOutgoingData(const std::any &packet)
 
 			if (drop)
 			{
+				// A dropped group leaves nothing half-assembled behind
+				_unit_buffer.reset();
 				return;
 			}
 		}
@@ -299,7 +301,34 @@ void OvtSession::SendOutgoingData(const std::any &packet)
 	auto copy_packet = std::make_shared<OvtPacket>(*session_packet);
 	copy_packet->SetSessionId(GetId());
 
-	_connector->Send(copy_packet->GetData());
+	// One logical unit goes out in one `Send()`, the rule `SendMessageDirect()` and
+	// `OvtPublisher::SendResponse()` already follow. An edge reassembles a message or a media packet
+	// from consecutive fragments, so anything another writer on this connection puts between two of
+	// them lands in the same reassembly buffer. The packetizer marks the last fragment of every unit,
+	// so this holds nothing past the unit being assembled.
+	if (((_unit_buffer == nullptr) || _unit_buffer->IsEmpty()) && session_packet->Marker())
+	{
+		// A unit that fits in one packet, which is every message and every small media packet
+		_connector->Send(copy_packet->GetData());
+		return;
+	}
+
+	if (_unit_buffer == nullptr)
+	{
+		_unit_buffer = std::make_shared<ov::Data>();
+	}
+
+	_unit_buffer->Append(copy_packet->GetData());
+
+	if (session_packet->Marker() == false)
+	{
+		return;
+	}
+
+	auto unit = _unit_buffer;
+	_unit_buffer.reset();
+
+	_connector->Send(unit);
 }
 
 void OvtSession::SetAllowedTrackIds(const std::set<uint32_t> &allowed_track_ids)

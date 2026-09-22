@@ -93,6 +93,10 @@ private:
 	bool							_is_ovt2 = false;
 	// True while the next media fragment starts a new serialized `MediaPacket`
 	bool							_at_group_start = true;
+
+	// Fragments of the unit being assembled, flushed in one `Send()` at its marker.
+	// Stream worker only, like the two flags above.
+	std::shared_ptr<ov::Data>		_unit_buffer;
 	OvtRequiredCursor				_required_cursor;
 	OvtTrackEpochCursor				_track_epoch_cursor;
 
