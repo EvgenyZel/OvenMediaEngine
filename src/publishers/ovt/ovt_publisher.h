@@ -43,19 +43,19 @@ private:
 		// and one for a message of a payload type an origin does not take
 		bool media_dropped			 = false;
 		bool unknown_message_dropped = false;
-		// The stream this connection described last, and its track epoch at that moment.
-		// The session created by the following play carries the epoch so it can tell whether a NOTIFY
-		// went out while it was still behind the send gate.
-		// The id comes with it because a connection can describe one stream and play another,
-		// and every stream starts at the same epoch: without the id a coincidental match would
-		// settle a session that never saw that stream's description.
+		// What this connection described last: the stream, the instance of it, and its track epoch then.
+		// The play that follows hands the epoch to its session, which uses it to spot a NOTIFY that went out
+		// while the session was still behind the send gate.
+		// A different key is another stream, which a connection may play.
+		// The same key with another id is that stream recreated, which the play refuses.
+		ov::String described_stream_key;
 		std::optional<info::stream_id_t> described_stream_id;
 		uint32_t track_epoch = 0;
 	};
 
 	// Records which stream this connection described and its track epoch at that moment,
 	// once the response is on its way
-	void RememberDescribedStream(const std::shared_ptr<ov::Socket> &remote, info::stream_id_t stream_id, uint32_t track_epoch);
+	void RememberDescribedStream(const std::shared_ptr<ov::Socket> &remote, const ov::String &stream_key, info::stream_id_t stream_id, uint32_t track_epoch);
 
 	//--------------------------------------------------------------------
 	// Implementation of Publisher

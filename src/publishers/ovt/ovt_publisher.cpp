@@ -564,6 +564,7 @@ void OvtPublisher::HandleDescribeRequest(const std::shared_ptr<ov::Socket> &remo
 	// difference the session catches up on; the other order could hide a change the description missed.
 	// It is recorded only once the response is on its way, so a failed describe leaves no baseline.
 	const auto described_epoch = stream->GetTrackEpoch();
+	const auto stream_key	   = ov::String::FormatString("%s/%s", vhost_app_name.CStr(), url->Stream().CStr());
 
 	Json::Value description;
 	bool filtered = false;
@@ -590,7 +591,7 @@ void OvtPublisher::HandleDescribeRequest(const std::shared_ptr<ov::Socket> &remo
 		{
 			OvtStream::RenumberIndexHints(description["stream"]);
 		}
-		RememberDescribedStream(remote, stream->GetId(), described_epoch);
+		RememberDescribedStream(remote, stream_key, stream->GetId(), described_epoch);
 		ResponseResult(remote, 0, "describe", request_id, 200, "ok", description);
 		return;
 	}
@@ -616,15 +617,16 @@ void OvtPublisher::HandleDescribeRequest(const std::shared_ptr<ov::Socket> &remo
 		root["ovt"]["required"].append(token.CStr());
 	}
 
-	RememberDescribedStream(remote, stream->GetId(), described_epoch);
+	RememberDescribedStream(remote, stream_key, stream->GetId(), described_epoch);
 	SendResponse(remote, 0, ov::Json::Stringify(root));
 }
 
-void OvtPublisher::RememberDescribedStream(const std::shared_ptr<ov::Socket> &remote, info::stream_id_t stream_id, uint32_t track_epoch)
+void OvtPublisher::RememberDescribedStream(const std::shared_ptr<ov::Socket> &remote, const ov::String &stream_key, info::stream_id_t stream_id, uint32_t track_epoch)
 {
-	auto context				 = GetRemoteContext(remote->GetNativeHandle());
-	context->described_stream_id = stream_id;
-	context->track_epoch		 = track_epoch;
+	auto context				  = GetRemoteContext(remote->GetNativeHandle());
+	context->described_stream_key = stream_key;
+	context->described_stream_id  = stream_id;
+	context->track_epoch		  = track_epoch;
 }
 
 void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, uint32_t request_id, const std::shared_ptr<const ov::Url> &url, const std::optional<std::set<uint32_t>> &requested_track_ids)
@@ -645,6 +647,20 @@ void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, 
 	{
 		ov::String msg;
 		msg.Format("There is no such stream (%s/%s)", vhost_app_name.CStr(), url->Stream().CStr());
+		ResponseResult(remote, 0, "play", request_id, 404, msg);
+		return;
+	}
+
+	// The describe and this play can land on two different instances of the same stream.
+	// The edge takes its tracks and playlists from the describe, so a changed instance is refused.
+	auto stream_key = ov::String::FormatString("%s/%s", vhost_app_name.CStr(), url->Stream().CStr());
+	auto context	= GetRemoteContext(remote->GetNativeHandle());
+	if (context->described_stream_id.has_value() && (context->described_stream_key == stream_key) &&
+		(*context->described_stream_id != stream->GetId()))
+	{
+		ov::String msg;
+		msg.Format("(%s) was recreated after this connection described it", stream_key.CStr());
+		logtw("%s. The edge has to describe it again", msg.CStr());
 		ResponseResult(remote, 0, "play", request_id, 404, msg);
 		return;
 	}
@@ -681,7 +697,6 @@ void OvtPublisher::HandlePlayRequest(const std::shared_ptr<ov::Socket> &remote, 
 		return;
 	}
 
-	auto context		 = GetRemoteContext(remote->GetNativeHandle());
 	// Only this connection's describe of this stream says what the edge already knows
 	auto described_epoch = (context->described_stream_id == stream->GetId())
 							   ? std::optional<uint32_t>(context->track_epoch)
