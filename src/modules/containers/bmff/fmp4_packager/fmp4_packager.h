@@ -56,8 +56,9 @@ namespace bmff
 		// Apply a pending key rotation to the segment about to start. The stream calls
 		// this from the storage callback that completes the previous segment, before
 		// that completion is published, so the new initialization section exists by
-		// the time the next partial is hinted. Returns false and keeps the rotation
-		// pending when this boundary cannot open a new version
+		// the time the next partial is hinted. Returns true only when the new version
+		// and its initialization section are in place; a boundary that cannot open a
+		// version keeps the rotation pending, a failed initialization section drops it
 		bool TryApplyPendingKeyRotationAtSegmentStart();
 
 		// End timestamp of the last appended sample, the boundary position for

@@ -210,14 +210,15 @@ namespace bmff
 		// section so its tenc/pssh carry that key; it is stored under the version
 		// advanced above
 		UpdateCencProperty(_pending_key_rotation.value());
+		_pending_key_rotation.reset();
+
 		if (CreateInitializationSegment() == false)
 		{
-			// The version has no initialization section and no key to advertise,
-			// so this track cannot be played from here on
+			// The version has no initialization section and no key to advertise, so this
+			// track cannot be played from here on and the caller must not hint the version
 			logtc("FMP4Packager::TryApplyPendingKeyRotationAtSegmentStart() - Failed to regenerate initialization segment for key rotation, track(%u)", GetMediaTrack()->GetId());
+			return false;
 		}
-
-		_pending_key_rotation.reset();
 
 		return true;
 	}
