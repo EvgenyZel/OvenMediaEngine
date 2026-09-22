@@ -1586,7 +1586,7 @@ void LLHlsStream::OnKeyPrefetched(uint64_t key_period_index, bool succeeded, con
 		_prefetched_key = cenc_property;
 	}
 
-	logti("LLHlsStream(%s/%s) - Fetched the DRM key of period %" PRIu64 " ahead of the rotation", GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), key_period_index);
+	logtd("LLHlsStream(%s/%s) - Fetched the DRM key of period %" PRIu64 " ahead of the rotation", GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), key_period_index);
 }
 
 void LLHlsStream::RotateDrmKey()
@@ -1636,7 +1636,8 @@ void LLHlsStream::RotateDrmKey()
 
 	ApplyRotatedKey(next_property);
 
-	logti("LLHlsStream(%s/%s) - DRM key rotation to key period %" PRIu64 " will take effect from the next segment of each track", GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), applied_index);
+	auto key_id_hex = (next_property.key_id != nullptr) ? next_property.key_id->ToHexString().UpperCaseString() : ov::String("-");
+	logti("LLHlsStream(%s/%s) - DRM key rotated: KEYID 0x%s, period %" PRIu64, GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), key_id_hex.CStr(), applied_index);
 }
 
 void LLHlsStream::CheckAutoKeyRotation(int64_t media_time_ms)
