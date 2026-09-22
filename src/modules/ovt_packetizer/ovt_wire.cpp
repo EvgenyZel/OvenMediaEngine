@@ -58,6 +58,8 @@ namespace ovt
 		return WIRE_NO_VALUE;
 	}
 
+	// `MH[29]` is read bit by bit, so a new flag takes the next free bit (`0x04`), not the next integer:
+	// a value that carries an existing bit reads as that flag on every build already deployed.
 	uint8_t ToOvtWire(MediaPacketFlag flag)
 	{
 		switch (flag)
