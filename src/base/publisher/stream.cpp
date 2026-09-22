@@ -341,11 +341,13 @@ namespace pub
 
 	bool Stream::EnterStop(StopCause cause)
 	{
-		_stop_cause = cause;
-
 		WaitUntilIdleAndLock();
 
-		bool ok = Stop();
+		// Set after the lock: two callers stopping the same stream would otherwise overwrite
+		// each other's cause before the first `Stop()` reads it.
+		_stop_cause = cause;
+
+		bool ok		= Stop();
 
 		Unlock();
 
