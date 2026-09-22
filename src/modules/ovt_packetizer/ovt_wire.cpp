@@ -11,12 +11,9 @@
 // OVT wire value table.
 // This table is the reference for the protocol values, not the C++ enums:
 // values are only ever appended, never reassigned or reordered.
-// No bit is reserved to mark an entry as required; that travels in the Required payload (PT 40).
-// Every field is a plain value except `MediaPacketFlag`, whose byte `MH[29]` is a bitmask:
-// its flags are single bits (`Unknown` is the wire value 0, the absence of a flag)
-// and the receive side reads them bit by bit.
-// A peer up to v0.21.0.0 casts that byte to a value instead,
-// so a flag added after this must take a single free bit, and a packet carrying it must not go to such a peer.
+// Every field is a plain value except `MediaPacketFlag`, whose byte `MH[29]` is a bitmask.
+// A peer up to v0.21.0.0 reads that byte as a value,
+// so a packet carrying a flag added after that release must not go to one.
 // The full (enumerator, wire value) list is pinned by `ovt_wire_test.cpp`,
 // and changing an existing row there is changing the protocol.
 //

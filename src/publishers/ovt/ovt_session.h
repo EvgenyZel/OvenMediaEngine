@@ -104,10 +104,8 @@ private:
 	// the OVT publisher request thread (via `SetAllowedTrackIds()` during `HandlePlayRequest()`)
 	// and read by the stream worker thread (via `SendOutgoingData()` and `SendTrackSnapshotIfStale()`).
 	// Both sides acquire `_track_set_filter_mutex` to establish the synchronizes-with edge.
-	//
-	// When `_track_set_filter_enabled` is `false`, no filtering is performed (full stream is forwarded).
-	// When `true`, only media packets whose track id is in `_allowed_track_ids` are forwarded;
-	// an empty `_allowed_track_ids` in this state drops every media packet.
+	// An empty `_allowed_track_ids` while enabled drops every media packet,
+	// which is not the same as being disabled.
 	mutable ov::Mutex _track_set_filter_mutex;
 	bool _track_set_filter_enabled OV_GUARDED_BY(_track_set_filter_mutex) = false;
 	std::set<uint32_t> _allowed_track_ids OV_GUARDED_BY(_track_set_filter_mutex);

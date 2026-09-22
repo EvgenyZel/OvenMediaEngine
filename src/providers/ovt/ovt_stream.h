@@ -73,18 +73,15 @@ namespace pvd
 	private:
 		// One origin connection: its socket and depacketizer, what it told us about itself,
 		// and what has already been logged for it.
-		// A connection replaces this whole object instead of clearing it, because the media path can
-		// still be inside the previous connection when the next one starts.
-		// Everything that path needs comes from one load, so it never pairs the socket of one
-		// connection with the depacketizer of another.
+		// A connection replaces this whole object instead of clearing it, so one load hands the media
+		// path a socket and a depacketizer that belong to the same connection.
 		//
 		// `_state` orders the handshake ahead of the media path in the ordinary case, but a stop
 		// followed at once by a resume can leave the motor inside `ProcessMediaPacket()` holding this
 		// object while the next handshake writes it. The two members both paths touch carry their own
 		// ordering; the rest belong to one thread each and say which.
-		// That is per member, not for the object: the socket and the depacketizer have no lock of their
-		// own, so the two threads can still reach them at the same time in that window. Swapping the
-		// whole object narrowed it and did not close it (known issue).
+		// The socket and the depacketizer have none of their own, so in that window the two threads can
+		// still reach them at the same time (known issue).
 		struct Connection
 		{
 			// Filled in before the object is published, and not written again

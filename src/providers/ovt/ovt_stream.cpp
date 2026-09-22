@@ -550,9 +550,8 @@ namespace pvd
 			//
 			// A track id the first describe did not carry is named rather than added.
 			// `info::Stream` orders its track containers at setup and the readers load slots without
-			// a lock, so adding one here would restructure them while the media path walks them,
-			// and no consumer would see it either: they copied this stream when it was created
-			// and there is no update path to them.
+			// a lock, so adding one here would restructure them while the media path walks them.
+			// No consumer would see it either: they copied this stream when it was created.
 			if (GetTrack(new_track->GetId()) == nullptr)
 			{
 				if (_track_layout_fixed)
@@ -573,14 +572,12 @@ namespace pvd
 		}
 		_described_tracks.clear();
 
-		// A track an earlier describe registered but this one does not carry stays on this object.
-		// `info::Stream` has no way to remove one after the stream is shared:
-		// `MediaTrackGroup` fixes its structure at setup so the lock-free readers can load slots
-		// without a lock, and `RemoveTrack()` is a setup-only entry point.
+		// A track an earlier describe registered but this one does not carry stays on this object,
+		// for the same reason a late one cannot be added: `RemoveTrack()` is a setup-only entry point.
 		// The track then receives no media, and the rule that the registered set is a subset of
 		// the play set does not hold across a failover re-describe.
-		// It is left in place and named here, because the moment it becomes a ghost is this one
-		// and nothing downstream can tell it apart from a track that is merely quiet.
+		// It is named here because this is the moment it becomes a ghost, and nothing downstream can
+		// tell it apart from a track that is merely quiet.
 		std::vector<ov::String> ghosts;
 		for (const auto &[track_id, track] : GetTracks())
 		{
