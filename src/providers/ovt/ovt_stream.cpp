@@ -1184,12 +1184,24 @@ namespace pvd
 			{
 				logte("Audio track(%u) received from origin has samplerate=0. The origin may have sent an invalid AudioSpecificConfig.", new_track->GetId());
 			}
-			auto sample_format = ovt::FromOvtWireInt<cmn::AudioSample::Format>(json_audio_track["sampleFormat"].asInt()).value_or(cmn::AudioSample::Format::None);
+			auto wire_sample_format = ovt::FromOvtWireInt<cmn::AudioSample::Format>(json_audio_track["sampleFormat"].asInt()).value_or(cmn::AudioSample::Format::None);
+			auto sample_format		= wire_sample_format;
 			if (connection->origin_is_ovt2 && json_audio_track["sampleFormatName"].isString())
 			{
 				sample_format = cmn::GetAudioSampleFormatByName(json_audio_track["sampleFormatName"].asString().c_str()).value_or(cmn::AudioSample::Format::None);
 			}
 			new_track->SetSampleFormat(sample_format);
+
+			if (sample_format != wire_sample_format)
+			{
+				if (description_mismatch.IsEmpty() == false)
+				{
+					description_mismatch.Append(", and ");
+				}
+
+				description_mismatch.AppendFormat("sample format name (%s) disagrees with the integer (%s), and the name is used",
+												  new_track->GetSample().GetName(), cmn::AudioSample(wire_sample_format).GetName());
+			}
 			// The layout value is the OR of its channel bits, so there is no wire table to go through,
 			// only the question of whether this build defines that combination.
 			// One it does not is left `LayoutUnknown` and kept as received, so a relay hands the next hop
