@@ -152,7 +152,8 @@ namespace pvd
 
 		// Installs what the last describe parsed:
 		// the playlists replace the previous set,
-		// and the tracks in `allowed_track_ids` (all of them when `nullopt`) are added or changed.
+		// and the tracks in `allowed_track_ids` are added or changed.
+		// `nullopt` means an OVT1 origin, which names none, so every described track is registered.
 		// The track layout is settled by the first SUCCESSFUL PLAY RESPONSE, on the tracks the describe
 		// carried and `allowedTrackIds` confirmed. After that, an id this stream does not already have is
 		// named in a warning rather than added, and a track the new describe no longer carries stays

@@ -1479,13 +1479,16 @@ namespace pvd
 					  GetApplicationInfo().GetVHostAppName().CStr(), GetName().CStr(), GetId(), ignored);
 			}
 
+			// An origin that sent an `ovt` object said it speaks OVT2,
+			// and OVT2 answers play with this array.
+			// Without it nothing states what the origin will send, so registering the described
+			// set would be a guess that the subset rule above cannot stand on. The response is refused.
 			if (allowed_track_ids.has_value() == false)
 			{
-				// Every described track is registered instead, which is the one case where the subset
-				// rule above does not hold. Only an origin that does not follow OVT2 reaches this.
-				logtw("%s/%s(%u) - OVT2 origin answered play without an allowedTrackIds array; "
-					  "every described track is registered",
+				logte("%s/%s(%u) - OVT2 origin answered play without an allowedTrackIds array",
 					  GetApplicationInfo().GetVHostAppName().CStr(), GetName().CStr(), GetId());
+
+				return false;
 			}
 
 			// The describe's playlists were built before this edge made its selection, so its renditions
