@@ -104,7 +104,8 @@ bool OriginMapClient::ProcessPendingUnregisters()
 
 	for (auto &[app_stream_name, session_id] : candidates)
 	{
-		bool do_del = false;
+		bool stale = true;
+		bool registered = false;
 		{
 			std::lock_guard<std::recursive_mutex> lock(_origin_map_mutex);
 			// Only unregister if the session ID matches: a different ID means the stream
@@ -112,18 +113,23 @@ bool OriginMapClient::ProcessPendingUnregisters()
 			auto session_it = _session_map.find(app_stream_name);
 			if (session_it != _session_map.end() && session_it->second == session_id)
 			{
+				stale = false;
 				_origin_map_candidates.erase(app_stream_name);
-				do_del = _origin_map.erase(app_stream_name) > 0;
+				registered = _origin_map.erase(app_stream_name) > 0;
 				_session_map.erase(session_it);
 			}
 		}
-		if (do_del)
+		if (registered)
 		{
 			Unregister(app_stream_name);
 		}
+		else if (stale)
+		{
+			logti("OriginMapStore: <%s> unregister skipped (reconnected)", app_stream_name.CStr());
+		}
 		else
 		{
-			logti("OriginMapStore: <%s> pending unregister skipped - stream reconnected", app_stream_name.CStr());
+			logti("OriginMapStore: <%s> unregister skipped (not registered)", app_stream_name.CStr());
 		}
 	}
 
